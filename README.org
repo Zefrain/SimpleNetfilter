@@ -1,0 +1,116 @@
+#+SETUPFILE: ~/Documents/style.setup
+#+STARTUP: align
+#+LATEX_HEADER: \usepackage{ulem}
+#+LATEX_HEADER: \usepackage{ctex}
+#+LaTeX_HEADER: \sectionfont{\normalfont\scshape}
+#+LaTeX_HEADER: \subsectionfont{\normalfont\itshape}
+#+AUTHOR: 周尚
+
+* 需求
+  通过http协议的host字段实现阻断的功能
+  1. 可配置1w个host，并实现host规则的管理（只考虑添加、删除即可）
+  2. 针对网络中的流量进行匹配，如果命中配置的host的流量就阻断，否则放行
+* 运行
+  1. 环境：CentOS 7
+  2. 配置：/etc/simple_nf.d/hostlist *host 长度 <= 31 字节*
+  3. 运行：
+     #+begin_src sh
+       cd src
+       make
+       insmod snf.ko
+     #+end_src
+  4. 清理：
+     #+begin_src sh
+       make clean
+     #+end_src
+  5. 卸载
+     #+begin_src sh
+       rmmod snf
+     #+end_src
+  6. 更新配置文件后需要 卸载后重新运行
+* 项目说明
+** 功能模块
+   - 维护 Host 列表（哈希表）
+     - 头文件结构 =file.h=
+       #+begin_src c
+         #define HASH_MASK_BITS 0x3 /* & 0011 */
+         #define HOST_HASH_SIZE 4
+
+         struct hlist_nulls_head {
+             struct hlist_nulls_node* first;
+         };
+
+         struct hlist_nulls_node {
+             struct hlist_nulls_node *next, **pprev;
+         };
+
+         typedef struct host_hash_s host_hash_t;
+         struct host_hash_s {
+             struct hlist_nulls_node hnode;
+             char*                   data; /* host list */
+         };
+
+         struct hlist_nulls_head* hhash_head;
+       #+end_src
+     - 结构图
+       [[file:hash_host.png]]
+     - hash 存储方案
+       1. 将数据通过 MurmurHash 算法计算 hash 值
+       2. 将上一步获取的 hash & HASH_MASK_BITS 后获取新的 hash 值
+       3. 在 hhash_head[hash] 链查询数据是否已存在，未存在则添加到 hhash_head[hash] 链，否则放弃
+   - 流量拦截
+     1. 通过 NetFilter 钩子实现拦截网络数据包
+     2. 过滤 IP 包
+     3. 过滤 TCP 协议
+     4. 通过解TCP包过滤协议类型为 HTTP
+     5. 提取包头获取 Host
+     6. 判断 Host 是否在黑名单
+        - 对 Host 字段值计算 hash 后去相应入口查询
+          - 如有匹配项则丢弃包
+          - 否则放行
+
+** 流程图
+   #+begin_src plantuml :file process.png :cmd charset utf-8
+     (*) --> "加载 Host 列表"
+     --> "劫持数据包"
+     --> "FORWARD 链 (测试用 LOCAL_IN)"
+     --> "过滤 TCP 协议"
+     --> "获取 TCP 报文数据"
+     --> "过滤 HTTP 协议"
+     --> "获取 Host"
+     if "是 Host 列表成员？" then
+             --> [是] "NF_DROP"
+             --> (*)
+     else
+             --> [否] "NF_ACCEPT"
+             --> (*)
+     endif
+   #+end_src
+
+   #+RESULTS:
+   [[file:process.png]]
+
+** 部分 API 说明
+   - filter_init(void): 完成读取配置，注册网络钩子
+     - get_g_htable(): 申请内存，读取配置文件
+     - hit_http(): HTTP 协议匹配，非 HTTP 协议放行
+     - hit_host(): Host 命中时阻断
+   - filter_done(void): 退出前清理内存，注销钩子
+
+** 关键数据结构
+   - linux/netfilter.h : struct nf_hook_ops
+   - linux/skbuff.h: struct sk_buff
+   - net/ip.h: struct iphdr
+   - net/tcp.h: struct tcphd
+   - << Linux Kernel Development >> : struct file
+
+* 参考资料
+  - [[https://www.netfilter.org/documentation/HOWTO/netfilter-hacking-HOWTO-3.html][Linux netfilter Hacking HOWTO: Netfilter Architecture]]
+  - [[https://www.cnblogs.com/tzh36/p/5424564.html][Linux内核：sk_buff解析 - 唐稚骅 - 博客园]]
+  - [[https://www.cnblogs.com/codestack/p/10850642.html][linux netfilter 五个钩子点 - codestacklinuxer - 博客园]]
+  - [[https://www.frozentux.net/iptables-tutorial/cn/iptables-tutorial-cn-1.1.19.html#TRAVERSINGOFTABLES][Iptables 指南 1.1.19]]
+  - [[https://stackoverflow.com/questions/42385002/how-to-get-payload-from-struct-sk-buff-in-netfilter-kernel-module-linux][c - How to get payload from struct sk_buff in netfilter kernel module linux - Stack Overflow]]
+  - [[https://stackoverflow.com/questions/1184274/read-write-files-within-a-linux-kernel-module][c - Read/write files within a Linux kernel module - Stack Overflow]]
+  - [[https://www.kernel.org/doc/html/latest/filesystems/api-summary.html][Linux Filesystems API summary — The Linux Kernel documentation]]
+  - [[https://www.unix.com/man-page/suse/9/filp_open/][filp_open(9) [suse man page]​]]
+  - [[https://www.kfki.hu/~kadlec/sw/netfilter/ct3/][Conntrack hash functions]]
